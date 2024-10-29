@@ -7,6 +7,7 @@ import (
 )
 
 // 在lru的基础上实现了并发访问
+// 作为单个group的缓存内核
 type cache struct {
 	mu         sync.Mutex
 	lru        *lru.Cache

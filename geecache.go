@@ -1,6 +1,10 @@
 package main
 
-import "sync"
+import (
+	"geeCache/singleflight"
+	"log"
+	"sync"
+)
 
 /**
 														是
@@ -27,10 +31,17 @@ func (f GetterFunc) Get(key string) ([]byte, error) {
 }
 
 // A Group is a cache namespace and associated data loaded spread over
+// 将缓存抽象为多个group，每个内核都是封装好的cache，支持并发访问
+// 类似于redis的1~50的那种group
 type Group struct {
 	name      string
-	getter    Getter
+	getter    Getter // 当本地缓存和远端节点都加载失败的处理方法，用户提供
 	mainCache cache
+
+	peers PeerPicker // 用于获取远端处理节点
+	// Use singleflight.Group to make sure that
+	// each key is only fetch once
+	singleLoader *singleflight.Group
 }
 
 var (
@@ -38,12 +49,20 @@ var (
 	groups = make(map[string]*Group)
 )
 
+// register peers for remote peers
+func (g *Group) Register(peers PeerPicker) {
+	if g.peers != nil {
+		panic("registerPeerPicker called more than once")
+	}
+	g.peers = peers
+}
+
 // Get value from group's cache
 func (g *Group) Get(key string) (val ByteView, err error) {
 	var ok bool
 
-	val, ok = g.mainCache.get(key)
-	if ok { // 直接在cache中找到了数据
+	val, ok = g.mainCache.get(key) // 先尝试去本机的group查找
+	if ok {                        // 直接在本机的节点上找到了数据
 		return val, nil
 	}
 	// 未找到则从回调函数中查找
@@ -51,10 +70,28 @@ func (g *Group) Get(key string) (val ByteView, err error) {
 	return val, err
 }
 
-// 加载未在缓存上的数据
+// 加载未在本机上缓存的数据
 // 留出加载远程节点 or 源数据的接口
-func (g *Group) load(key string) (ByteView, error) {
-	return g.getLocally(key)
+func (g *Group) load(key string) (value ByteView, err error) {
+	//将短时间内多个相同key的请求合并
+	viewi, err := g.singleLoader.Do(key, func() (interface{}, error) {
+		if g.peers != nil { // 若有远端节点注册，则去远端节点查看
+			if peer, ok := g.peers.PickPeer(key); ok {
+				if value, err = g.getFromPeer(peer, key); err == nil {
+					return value, nil
+				}
+				log.Println("[GeeCache] Failed to get from peer", peer, err)
+			}
+		}
+
+		// 若在远端节点查找失败，则转到本地节点处理
+		return g.getLocally(key)
+	})
+	// 远端请求或slow DB加载数据结束
+	if err == nil {
+		return viewi.(ByteView), nil
+	}
+	return
 }
 
 // 未找到数据时，根据回调函数获取key对应的cache
@@ -68,6 +105,15 @@ func (g *Group) getLocally(key string) (ByteView, error) {
 	value := ByteView{bytes}
 	g.populateCache(key, value)
 	return value, nil
+}
+
+// 从远端peer中Get缓存
+func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
+	bytes, err := peer.Get(g.name, key)
+	if err != nil {
+		return ByteView{}, err
+	}
+	return ByteView{bytes}, nil
 }
 
 // 将没找到但是心找到的数据添加到cache中
@@ -84,9 +130,10 @@ func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
 	defer mu.Unlock()
 
 	g := &Group{
-		name:      name,
-		getter:    getter,
-		mainCache: cache{cacheBytes: cacheBytes},
+		name:         name,
+		getter:       getter,
+		mainCache:    cache{cacheBytes: cacheBytes},
+		singleLoader: new(singleflight.Group),
 	}
 	groups[name] = g
 

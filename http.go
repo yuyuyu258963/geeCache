@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	pb "geeCache/cachepb"
 	"geeCache/consistenthash"
 	"io"
 	"log"
@@ -9,6 +10,8 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+
+	"google.golang.org/protobuf/proto"
 )
 
 // as the server's base url prefix
@@ -76,8 +79,15 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 将缓存得到的缓存结果转为二进制然后，将这个二进制bytes返回
+	body, err := proto.Marshal(&pb.Response{Value: val.ByteSlice()})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/octet-stream") // 以字节流的形式返回
-	w.Write(val.ByteSlice())
+	w.Write(body)
 }
 
 // 添加远端服务的节点
@@ -120,31 +130,40 @@ func newHttpGetter(baseURL string) *httpGetter {
 }
 
 // Query from remote node
-func (s *httpGetter) Get(group string, key string) ([]byte, error) {
+// 将请求要用到的放在pb.Request中
+// 请求得到的结果放在pb.Response
+func (s *httpGetter) Get(in *pb.Request, out *pb.Response) error {
 	// 向远端节点的请求地址
 	m := fmt.Sprintf("%v%v/%v",
-		s.baseURL+defaultBasePath, // defaultBasePath 作为跟路由表示请求的是cache服务
-		url.QueryEscape(group),    // url.QueryEscape 用于对字符串进行URL编码，用于在URL中嵌入特殊字符，将非数字字符转化为百分号后跟两位十六进制数，使得这些字符可以安全地被包含在url中
-		url.QueryEscape(key),
+		s.baseURL+defaultBasePath,      // defaultBasePath 作为跟路由表示请求的是cache服务
+		url.QueryEscape(in.GetGroup()), // url.QueryEscape 用于对字符串进行URL编码，用于在URL中嵌入特殊字符，将非数字字符转化为百分号后跟两位十六进制数，使得这些字符可以安全地被包含在url中
+		url.QueryEscape(in.GetKey()),
 	)
 
 	response, err := http.Get(m)
 	if err != nil {
 		log.Printf("[m:%s] Get Error %s ", m, err.Error())
-		return nil, err
+		return err
 	}
 	defer response.Body.Close() // don't forget to close body or will be unsafe
 
 	if response.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("server returned:  %v", response.Status)
+		return fmt.Errorf("server returned:  %v", response.Status)
 	}
 
+	// 读取返回结果的body中的bytes
 	bytes, err := io.ReadAll(response.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read response body: %v", err)
+		return fmt.Errorf("read response body: %v", err)
+	}
+
+	// 将请求得到的二进制流转为 pb.Response
+	if err = proto.Unmarshal(bytes, out); err != nil {
+		return fmt.Errorf("proto.Unmarshal error: %v", err)
 	}
 
 	// success Get
 	log.Printf("success Get from %v", m)
-	return bytes, nil
+
+	return nil
 }

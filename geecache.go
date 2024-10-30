@@ -1,6 +1,7 @@
 package main
 
 import (
+	pb "geeCache/cachepb"
 	"geeCache/singleflight"
 	"log"
 	"sync"
@@ -109,11 +110,17 @@ func (g *Group) getLocally(key string) (ByteView, error) {
 
 // 从远端peer中Get缓存
 func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
-	bytes, err := peer.Get(g.name, key)
+	req := &pb.Request{
+		Group: g.name,
+		Key:   key,
+	}
+	res := &pb.Response{}
+
+	err := peer.Get(req, res) // 使用protobuf进行通信
 	if err != nil {
 		return ByteView{}, err
 	}
-	return ByteView{bytes}, nil
+	return ByteView{b: res.Value}, nil
 }
 
 // 将没找到但是心找到的数据添加到cache中
